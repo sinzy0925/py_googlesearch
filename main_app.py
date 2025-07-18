@@ -1,5 +1,3 @@
-# main_app.py (KeyErrorを修正した、真の最終完成版)
-
 from gemini_agent import ask_agent
 import argparse
 import time
@@ -32,6 +30,7 @@ def setup_logger(timestamp: str) -> tuple[logging.Logger, str]:
 def generate_markdown_report(log_summary: dict, base_filename: str):
     """
     実行結果のサマリーから、人間可読なMarkdownレポートを生成する。
+    トークン使用量の詳細も含まれる。
     """
     md_filename = f"{base_filename}.md"
     
@@ -41,10 +40,7 @@ def generate_markdown_report(log_summary: dict, base_filename: str):
             f.write(f"# Gemini Agent Batch Report\n\n")
             f.write(f"**Execution Date:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write(f"**Total Queries:** {summary['total_queries']}\n")
-            # --- ここが修正箇所 ---
-            # 'total_duration_seconds' というキーを正しく参照
             f.write(f"**Total Duration:** {summary['total_duration_seconds']:.2f} seconds\n\n")
-            # --------------------
             f.write("---\n\n")
 
             for result in log_summary["results"]:
@@ -60,8 +56,12 @@ def generate_markdown_report(log_summary: dict, base_filename: str):
                     
                     if data.get('answer'):
                         f.write(f"### Answer\n\n")
-                        formatted_answer = data['answer'].replace('\n', '  \n')
-                        f.write(f"{formatted_answer}\n\n")
+                        # CSVデータの場合、コードブロックとして整形する
+                        if "```csv" in data['answer'] or "会社名,電話番号,住所" in data['answer']:
+                            f.write(f"```csv\n{data['answer'].strip()}\n```\n\n")
+                        else:
+                            formatted_answer = data['answer'].replace('\n', '  \n')
+                            f.write(f"{formatted_answer}\n\n")
 
                     if data.get('sources'):
                         f.write(f"### Sources\n\n")
@@ -77,6 +77,15 @@ def generate_markdown_report(log_summary: dict, base_filename: str):
                             url = source.get('url', '#')
                             f.write(f"- **{title}**: <{url}>\n")
                         f.write("\n")
+                    
+                    # トークン使用量のセクションを追加
+                    if data.get('usage_metadata'):
+                        usage = data['usage_metadata']
+                        f.write(f"### Token Usage\n\n")
+                        f.write(f"- **Input (Prompt):** {usage.get('prompt_token_count', 'N/A')} tokens\n")
+                        f.write(f"- **Output (Thought + Answer):** {usage.get('candidates_token_count', 'N/A')} tokens\n")
+                        f.write(f"- **Tool Response (Hidden):** {usage.get('tool_token_count', 'N/A')} tokens\n")
+                        f.write(f"- **Total:** {usage.get('total_token_count', 'N/A')} tokens\n\n")
 
                 elif 'error_message' in result:
                     f.write(f"**Error Details:**\n")
@@ -151,6 +160,23 @@ async def main():
             elif results:
                 successful_tasks += 1
                 query_result["status"] = "SUCCESS"
+
+                # usage_metadataオブジェクトを、JSONに変換可能な「普通の辞書」に変換し、「隠れトークン」を計算する
+                if 'usage_metadata' in results and results.get('usage_metadata'):
+                    usage = results['usage_metadata']
+                    
+                    prompt_tokens = usage.prompt_token_count
+                    candidate_tokens = usage.candidates_token_count
+                    total_tokens = usage.total_token_count
+                    
+                    tool_tokens = max(0, total_tokens - prompt_tokens - candidate_tokens)
+                    
+                    results['usage_metadata'] = {
+                        'prompt_token_count': prompt_tokens,
+                        'candidates_token_count': candidate_tokens,
+                        'tool_token_count': tool_tokens,
+                        'total_token_count': total_tokens
+                    }
                 
                 if results.get('sources'):
                     resolution_tasks = [resolve_redirect_url(session, source) for source in results['sources']]
@@ -166,17 +192,14 @@ async def main():
     total_end_time = time.time()
     total_duration = total_end_time - start_time
 
-    # --- ここが修正箇所 ---
-    # log_summaryを構築する際に、'total_duration_seconds'というキーで合計時間を格納
     log_summary = {
         "execution_summary": {
             "total_queries": len(queries),
             "max_workers": args.max_workers,
-            "total_duration_seconds": round(total_duration, 2), # このキーを追加
+            "total_duration_seconds": round(total_duration, 2),
         },
         "results": log_summary_results
     }
-    # --------------------
     
     # ログファイルにJSON形式で書き出す
     logger.info(json.dumps(log_summary, indent=2, ensure_ascii=False))
@@ -194,6 +217,16 @@ async def main():
         if result_log['status'] == 'SUCCESS':
             answer_snippet = result_log['data']['answer'].replace('\n', ' ').strip()
             print(f"  [回答の要約]: {answer_snippet[:100]}...")
+            
+            # トークン使用量の表示部分
+            if result_log['data'].get('usage_metadata'):
+                usage = result_log['data']['usage_metadata']
+                print("  [トークン使用量]:")
+                print(f"    - 入力 (プロンプト): {usage.get('prompt_token_count', 'N/A')} トークン")
+                print(f"    - 出力 (思考+回答): {usage.get('candidates_token_count', 'N/A')} トークン")
+                print(f"    - ツール応答 (隠れ): {usage.get('tool_token_count', 'N/A')} トークン")
+                print(f"    - 合計: {usage.get('total_token_count', 'N/A')} トークン")
+
         elif 'error_message' in result_log:
             print(f"  [エラー内容]: {result_log['error_message']}")
 

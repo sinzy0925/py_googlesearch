@@ -149,7 +149,12 @@ async def ask_agent(query: str) -> dict | None:
                         sources.append({'title': chunk.web.title, 'url': chunk.web.uri})
                     except (IndexError, AttributeError): continue
         
-        return {'answer': answer, 'sources': sources, 'thought_summary': thought_summary}
+        return {
+            'answer': answer, 
+            'sources': sources, 
+            'thought_summary': thought_summary,
+            'usage_metadata': response.usage_metadata
+            }
 
     except Exception as e:
         print(f"APIとの通信中にエラーが発生しました: {e}")
