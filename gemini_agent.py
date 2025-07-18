@@ -1,4 +1,4 @@
-# gemini_agent.py (自己評価と反復検索のロジックを組み込んだ、アーキテクチャ最終完成版)
+# gemini_agent.py (非同期性を完全に修復した、真の最終完成版)
 
 from google import genai
 from google.genai import types
@@ -14,15 +14,15 @@ except Exception as e:
     client = None
     print(f"エージェント初期化エラー: APIキーの設定に失敗しました。: {e}")
 
-def _decide_strategy(query: str) -> dict:
+# --- 修正点1: 'async def' に戻す ---
+async def _decide_strategy(query: str) -> dict:
     """
     【内部専用】第一エージェント：思考戦略プランナー。
-    このモジュールの外から呼び出されることはない。
     """
     if not client:
+        print("戦略プランナーが初期化されていません。デフォルト戦略を適用します。")
         return {'language': 'japanese', 'difficulty': 'medium'}
 
-    # 戦略を決定させるためのFew-Shot & CoTプロンプト
     prompt = f"""
     You are a highly intelligent and meticulous strategic query analyzer. Your role is to determine the optimal strategy for a subordinate AI agent. You must follow the rules and examples provided below with extreme precision. Your final output must be a single, valid JSON object and nothing else.
 
@@ -55,7 +55,8 @@ def _decide_strategy(query: str) -> dict:
     """
     
     try:
-        response = client.models.generate_content(
+        # --- 修正点2: 'await' を付け、非同期クライアント 'client.aio' を使う ---
+        response = await client.aio.models.generate_content(
             model='gemini-2.5-flash',
             contents=prompt,
             config=types.GenerateContentConfig(response_mime_type="application/json")
@@ -69,7 +70,8 @@ def _decide_strategy(query: str) -> dict:
         print(f"戦略プランニングでエラーが発生したため、デフォルト戦略を適用します: {e}")
         return {'language': 'japanese', 'difficulty': 'medium'}
 
-def ask_agent(query: str) -> dict | None:
+# --- 修正点3: 'async def' に戻す ---
+async def ask_agent(query: str) -> dict | None:
     """
     【唯一の公開窓口】ユーザーの質問を受け取り、戦略決定から回答生成までを一貫して行う。
     """
@@ -78,7 +80,8 @@ def ask_agent(query: str) -> dict | None:
         return None
 
     print("\nエージェント (戦略プランニング中...):")
-    strategy = _decide_strategy(query)
+    # --- 修正点4: 'await' を付けて内部の非同期関数を呼び出す ---
+    strategy = await _decide_strategy(query)
     
     thinking_language = strategy['language']
     difficulty = strategy['difficulty']
@@ -86,40 +89,50 @@ def ask_agent(query: str) -> dict | None:
     system_instruction = None
     thinking_config = {'include_thoughts': True}
 
-    # --- ここからが修正箇所 ---
-    # system_instruction（プロンプト）の定義を、自己評価と反復検索を強制するアルゴリズムに更新
     if thinking_language == 'english':
         system_instruction = (
-            "You are a meticulous and tenacious research agent. Your primary goal is to fully satisfy the user's request with the highest possible quality. Follow this multi-step process rigorously:\n"
-            "1.  **Initial Search & Compilation (Internal Thought):** First, think step-by-step in English to find as much information as possible. If the user asks for a list of a specific number of items (e.g., 30 stocks) with specific data points (e.g., dividend yields), your initial goal is to compile a raw list that meets the criteria.\n"
-            "2.  **Self-Correction and Refinement (Internal Thought):** Second, critically review your compiled list against the user's original request. Ask yourself: 'Does every single item in my list have the required data (e.g., a specific dividend yield)?' and 'Have I met the required number of items?'\n"
-            "3.  **Iterative Search (Internal Thought):** If your list is incomplete (missing data points or not enough items), YOU MUST GO BACK and perform additional, more specific search queries to fill in the gaps. For example, search for '[Stock Ticker] dividend yield'. Do not give up easily. Repeat this until your list is as complete as humanly possible.\n"
-            "4.  **Final Answer Generation:** Finally, based on your complete and refined list, generate the final answer in Japanese. If, and only if, after multiple exhaustive search iterations, you still cannot fully complete the list, you must explicitly state how many items you found and explain the rigorous steps you took to try to find the rest."
+            "You are a practical and resourceful research agent. Your primary goal is to provide the most helpful and complete answer possible to the user, even if the information on the web is imperfect.\n"
+            "1.  **Understand the Goal:** First, think step-by-step in English to fully understand the user's core request (e.g., they want a list of 30 companies with specific data points).\n"
+            "2.  **Best-Effort Search:** Use your tools to search for the information. Be tenacious. If you can't find information on one site, try another. If one search query fails, try a different one.\n"
+            "3.  **Compile and Report:** After your search, compile the most complete list you were able to create. \n"
+            "    - **It is OKAY if the list is not perfect.** \n"
+            "    - If you find a company but are missing a specific data point (like a phone number), list the company and explicitly state 'Phone number not found' for that entry.\n"
+            "    - If you cannot find the total number of items requested (e.g., you only found 15 out of 30), that is also okay. Simply provide the 15 you found.\n"
+            "4.  **Final Answer:** Your final priority is to be helpful. Present the best data you found, be honest about what you could not find, and then generate the final answer in Japanese."
         )
-    # --- 修正はここまで ---
     
+    model_name = 'gemini-2.5-flash'
     if difficulty == 'simple':
         thinking_config['thinking_budget'] = 0
-        print(f"エージェント (戦略決定: [{thinking_language.upper()}] 思考不要タスク：低予算で実行)")
+        print(f"\nエージェント (戦略決定: [{thinking_language.upper()}] 思考不要タスク：低予算で実行)")
+        print(f"model_name: {model_name} query: {query}")
     elif difficulty == 'hard':
         thinking_config['thinking_budget'] = 8192
-        print(f"エージェント (戦略決定: [{thinking_language.upper()}] 思考タスク：高予算で実行)")
+        print(f"\nエージェント (戦略決定: [{thinking_language.upper()}] 思考タスク：高予算で実行)")
+        print(f"model_name: {model_name} query: {query}")
     else: # medium
         thinking_config['thinking_budget'] = -1
-        print(f"エージェント (戦略決定: [{thinking_language.upper()}] 思考タスク：動的予算で実行)")
+        print(f"\nエージェント (戦略決定: [{thinking_language.upper()}] 思考タスク：動的予算で実行)")
+        print(f"model_name: {model_name} query: {query}")
     
     print("思考を開始します...")
     
-    grounding_tool = types.Tool(google_search=types.GoogleSearch())
-    config_dict = {'tools': [grounding_tool], 'thinking_config': types.ThinkingConfig(**thinking_config)}
+    tools_to_use = [
+        types.Tool(google_search=types.GoogleSearch()),
+        types.Tool(url_context=types.UrlContext())
+    ]
+    
+    config_dict = {'tools': tools_to_use, 'thinking_config': types.ThinkingConfig(**thinking_config)}
     if system_instruction:
         config_dict['system_instruction'] = system_instruction
     
     config = types.GenerateContentConfig(**config_dict)
-    model_name = 'gemini-2.5-flash' 
 
     try:
-        response = client.models.generate_content(model=model_name, contents=query, config=config)
+        # --- 修正点5: 'await' を付け、非同期クライアント 'client.aio' を使う ---
+        response = await client.aio.models.generate_content(
+            model=model_name, contents=query, config=config
+        )
         
         answer, thought_summary = "", ""
         for part in response.candidates[0].content.parts:

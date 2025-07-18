@@ -1,83 +1,211 @@
-# main_app.py (Geminiの存在を一切知らない、究極に純化された司令塔)
+# main_app.py (KeyErrorを修正した、真の最終完成版)
 
-# エージェントの「窓口」関数だけをインポートする。'client'はもう不要。
 from gemini_agent import ask_agent
 import argparse
 import time
-import requests
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import asyncio
+import os
+import json
+import logging
+from datetime import datetime
+import aiohttp
 
-def resolve_redirect_url(redirect_url: str) -> tuple[str, str]:
-    """
-    リダイレクトURLを解決して、最終的な本物のURLと、元のURLをタプルで返す。
-    """
-    try:
-        response = requests.head(redirect_url, allow_redirects=True, timeout=5)
-        return redirect_url, response.url
-    except requests.RequestException:
-        return redirect_url, redirect_url
+def setup_logger(timestamp: str) -> tuple[logging.Logger, str]:
+    """ログファイルを設定し、ロガーとベースファイル名を返す"""
+    log_dir = "log"
+    os.makedirs(log_dir, exist_ok=True)
+    base_filename = os.path.join(log_dir, timestamp)
+    json_log_filename = f"{base_filename}.json"
 
-def main():
+    logger = logging.getLogger('GeminiAgentLogger')
+    logger.setLevel(logging.INFO)
+    if logger.hasHandlers():
+        logger.handlers.clear()
+
+    file_handler = logging.FileHandler(json_log_filename, encoding='utf-8')
+    file_formatter = logging.Formatter('%(message)s')
+    file_handler.setFormatter(file_formatter)
+    logger.addHandler(file_handler)
+
+    return logger, base_filename
+
+def generate_markdown_report(log_summary: dict, base_filename: str):
     """
-    この関数の責務はただ一つ：ユーザーからの指令を受け取り、エージェントに渡し、
-    返ってきた報告書を見やすく表示すること。
+    実行結果のサマリーから、人間可読なMarkdownレポートを生成する。
     """
-    print("--------------------------------------------------")
-    print("Gemini検索エージェント (アーキテクチャ最終完成版)")
-    print("--------------------------------------------------")
+    md_filename = f"{base_filename}.md"
     
-    parser = argparse.ArgumentParser(description="Gemini検索エージェントにコマンドラインから質問します。")
-    parser.add_argument("query", type=str, help="エージェントに尋ねたい質問を文字列で指定します。")
-    args = parser.parse_args()
-    query = args.query
+    try:
+        with open(md_filename, 'w', encoding='utf-8') as f:
+            summary = log_summary["execution_summary"]
+            f.write(f"# Gemini Agent Batch Report\n\n")
+            f.write(f"**Execution Date:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"**Total Queries:** {summary['total_queries']}\n")
+            # --- ここが修正箇所 ---
+            # 'total_duration_seconds' というキーを正しく参照
+            f.write(f"**Total Duration:** {summary['total_duration_seconds']:.2f} seconds\n\n")
+            # --------------------
+            f.write("---\n\n")
 
+            for result in log_summary["results"]:
+                f.write(f"## Query {result['query_number']}: `{result['query']}`\n\n")
+                f.write(f"**Status:** `{result['status']}`\n\n")
+
+                if result['status'] == 'SUCCESS':
+                    data = result['data']
+                    if data.get('thought_summary'):
+                        f.write(f"### Thought Summary\n\n")
+                        thought_text = data['thought_summary'].strip()
+                        f.write(f"> {thought_text.replace('\n', '\n> ')}\n\n")
+                    
+                    if data.get('answer'):
+                        f.write(f"### Answer\n\n")
+                        formatted_answer = data['answer'].replace('\n', '  \n')
+                        f.write(f"{formatted_answer}\n\n")
+
+                    if data.get('sources'):
+                        f.write(f"### Sources\n\n")
+                        unique_sources_in_md = []
+                        seen_urls_in_md = set()
+                        for source in data.get('sources', []):
+                             if source.get('url') not in seen_urls_in_md:
+                                unique_sources_in_md.append(source)
+                                seen_urls_in_md.add(source.get('url'))
+                        
+                        for source in unique_sources_in_md:
+                            title = source.get('title', 'N/A')
+                            url = source.get('url', '#')
+                            f.write(f"- **{title}**: <{url}>\n")
+                        f.write("\n")
+
+                elif 'error_message' in result:
+                    f.write(f"**Error Details:**\n")
+                    f.write(f"```\n{result['error_message']}\n```\n\n")
+                
+                f.write("---\n\n")
+        print(f"Markdownレポートが保存されました: {md_filename}")
+    except IOError as e:
+        print(f"Markdownレポートの書き込みに失敗しました: {e}")
+
+async def resolve_redirect_url(session: aiohttp.ClientSession, source: dict) -> dict:
+    original_url = source.get('url')
+    if not original_url: return source
+    try:
+        async with session.head(original_url, allow_redirects=True, timeout=5) as response:
+            resolved_source = source.copy()
+            resolved_source['url'] = str(response.url)
+            return resolved_source
+    except Exception:
+        return source
+
+async def main():
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    logger, base_filename = setup_logger(timestamp)
+    
+    header = "--------------------------------------------------\n" \
+             "Gemini検索エージェント (デュアル出力・最終完成版)\n" \
+             "--------------------------------------------------"
+    print(header)
+    
+    parser = argparse.ArgumentParser(description="ファイルから複数の質問を読み込み、Gemini検索エージェントに並列で実行させます。")
+    parser.add_argument("query_file", type=str, help="処理したい質問が1行ずつ書かれたテキストファイルのパス。")
+    parser.add_argument("-w", "--max-workers", type=int, default=10, help="同時に実行する並列タスクの最大数。")
+    args = parser.parse_args()
+
+    try:
+        with open(args.query_file, 'r', encoding='utf-8') as f:
+            queries = [line.strip() for line in f if line.strip()]
+        if not queries:
+            print("エラー: クエリファイルが空か、読み取り可能なクエリがありません。")
+            return
+    except FileNotFoundError:
+        print(f"エラー: ファイルが見つかりません - {args.query_file}")
+        return
+    
+    print(f"{len(queries)}件のクエリを、最大{args.max_workers}の並列度で実行します...")
+    
     start_time = time.time()
     
-    # 司令塔の仕事は、これだけ。エージェントが裏で何をしているかは知る必要がない。
-    results = ask_agent(query)
-    
-    agent_end_time = time.time()
-    
-    if results:
-        if results['thought_summary']:
-            print("\n■ 思考の要約:")
-            print("---")
-            print(results['thought_summary'])
-            print("---")
+    semaphore = asyncio.Semaphore(args.max_workers)
+    async def run_with_semaphore(query):
+        async with semaphore:
+            return await ask_agent(query)
 
-        print("\n■ モデルの回答:")
-        print(results['answer'])
-        if results['sources']:
-            print("\n--- 回答の根拠となった情報 ---")
-            
-            unique_sources_before_resolution = []
-            seen_urls = set()
-            for source in results['sources']:
-                if source['url'] not in seen_urls:
-                    unique_sources_before_resolution.append(source)
-                    seen_urls.add(source['url'])
-            
-            print("\n情報源のURLを並列で解決中...")
-            final_sources = {}
-            with ThreadPoolExecutor(max_workers=10) as executor:
-                future_to_url = {executor.submit(resolve_redirect_url, source['url']): source['url'] for source in unique_sources_before_resolution}
-                for future in as_completed(future_to_url):
-                    original_url, final_url = future.result()
-                    final_sources[original_url] = final_url
-            
-            for i, source in enumerate(unique_sources_before_resolution):
-                resolved_url = final_sources.get(source['url'], source['url'])
-                print(f"\n[{i+1}] 情報源:")
-                print(f"    - タイトル: {source['title']}")
-                print(f"    - URL: {resolved_url}")
+    tasks = [run_with_semaphore(query) for query in queries]
+    results_list = await asyncio.gather(*tasks, return_exceptions=True)
 
+    agent_processing_end_time = time.time()
+    
+    # URL解決とロギング処理
+    print("\n情報源のURLを非同期・並列で解決中...")
+    
+    log_summary_results = []
+    successful_tasks = 0
+    
+    async with aiohttp.ClientSession() as session:
+        for i, results in enumerate(results_list):
+            query_result = {"query_number": i + 1, "query": queries[i]}
+            if isinstance(results, Exception):
+                query_result["status"] = "ERROR"
+                query_result["error_message"] = str(results)
+            elif results:
+                successful_tasks += 1
+                query_result["status"] = "SUCCESS"
+                
+                if results.get('sources'):
+                    resolution_tasks = [resolve_redirect_url(session, source) for source in results['sources']]
+                    resolved_sources = await asyncio.gather(*resolution_tasks, return_exceptions=True)
+                    results['sources'] = [s for s in resolved_sources if not isinstance(s, Exception)]
+
+                query_result["data"] = results
+            else:
+                query_result["status"] = "FAILURE"
+                query_result["error_message"] = "Agent returned an empty result."
+            log_summary_results.append(query_result)
+            
     total_end_time = time.time()
-    agent_time = agent_end_time - start_time
-    total_time = total_end_time - start_time
+    total_duration = total_end_time - start_time
+
+    # --- ここが修正箇所 ---
+    # log_summaryを構築する際に、'total_duration_seconds'というキーで合計時間を格納
+    log_summary = {
+        "execution_summary": {
+            "total_queries": len(queries),
+            "max_workers": args.max_workers,
+            "total_duration_seconds": round(total_duration, 2), # このキーを追加
+        },
+        "results": log_summary_results
+    }
+    # --------------------
     
-    print(f"\n>> エージェントの処理時間: {agent_time:.2f}秒")
-    print(f">> URL解決を含む合計処理時間: {total_time:.2f}秒")
-    print("\n--------------------------------------------------")
+    # ログファイルにJSON形式で書き出す
+    logger.info(json.dumps(log_summary, indent=2, ensure_ascii=False))
+    
+    # Markdownレポートを生成する
+    generate_markdown_report(log_summary, base_filename)
+    
+    # コンソールへのサマリー表示
+    print("\n==================================================")
+    print("           バッチ処理 結果サマリー")
+    print("==================================================")
+    for result_log in log_summary["results"]:
+        print(f"\n--- クエリ {result_log['query_number']:02d}: '{result_log['query']}' ---")
+        print(f"  [ステータス]: {result_log['status']}")
+        if result_log['status'] == 'SUCCESS':
+            answer_snippet = result_log['data']['answer'].replace('\n', ' ').strip()
+            print(f"  [回答の要約]: {answer_snippet[:100]}...")
+        elif 'error_message' in result_log:
+            print(f"  [エラー内容]: {result_log['error_message']}")
+
+    print("\n==================================================")
+    print("                  処理完了")
+    print("==================================================")
+    print(f"成功したタスク: {successful_tasks} / {len(queries)} 件")
+    print(f"合計処理時間: {total_duration:.2f}秒")
+    print(f"1クエリあたりの平均時間: {total_duration / len(queries):.2f}秒")
+    print(f"JSONログが保存されました: {base_filename}.json")
+    print(f"Markdownレポートが保存されました: {base_filename}.md")
+    print("--------------------------------------------------")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
