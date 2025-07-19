@@ -1,28 +1,20 @@
-# gemini_agent.py (非同期性を完全に修復した、真の最終完成版)
-
-from google import genai
-from google.genai import types
 import os
 import json
+from google import genai
+from google.genai import types
 from dotenv import load_dotenv
 
-load_dotenv() 
+# api_key_managerのシングルトンインスタンスをインポート
+from api_key_manager import api_key_manager
 
-try:
-    client = genai.Client()
-except Exception as e:
-    client = None
-    print(f"エージェント初期化エラー: APIキーの設定に失敗しました。: {e}")
+# .envファイルから環境変数を読み込む
+load_dotenv()
 
-# --- 修正点1: 'async def' に戻す ---
-async def _decide_strategy(query: str) -> dict:
+async def _decide_strategy(query: str, client: genai.Client) -> dict:
     """
     【内部専用】第一エージェント：思考戦略プランナー。
+    与えられたクライアントインスタンスを使用して戦略を決定する。
     """
-    if not client:
-        print("戦略プランナーが初期化されていません。デフォルト戦略を適用します。")
-        return {'language': 'japanese', 'difficulty': 'medium'}
-
     prompt = f"""
     You are a highly intelligent and meticulous strategic query analyzer. Your role is to determine the optimal strategy for a subordinate AI agent. You must follow the rules and examples provided below with extreme precision. Your final output must be a single, valid JSON object and nothing else.
 
@@ -55,12 +47,14 @@ async def _decide_strategy(query: str) -> dict:
     """
     
     try:
-        # --- 修正点2: 'await' を付け、非同期クライアント 'client.aio' を使う ---
         response = await client.aio.models.generate_content(
             model='gemini-2.5-flash',
-            contents=prompt,
-            config=types.GenerateContentConfig(response_mime_type="application/json")
+            contents=[prompt]
         )
+        # --- 修正箇所はここまで ---
+
+
+        # ```json ``` を消すロジックは、安全策として維持
         json_text = response.text.strip().replace('```json', '').replace('```', '').strip()
         strategy = json.loads(json_text)
         if 'language' not in strategy or 'difficulty' not in strategy:
@@ -70,25 +64,32 @@ async def _decide_strategy(query: str) -> dict:
         print(f"戦略プランニングでエラーが発生したため、デフォルト戦略を適用します: {e}")
         return {'language': 'japanese', 'difficulty': 'medium'}
 
-# --- 修正点3: 'async def' に戻す ---
 async def ask_agent(query: str) -> dict | None:
     """
     【唯一の公開窓口】ユーザーの質問を受け取り、戦略決定から回答生成までを一貫して行う。
     """
-    if not client:
-        print("エージェントが初期化されていません。")
+    # このクエリで使用するAPIキーを取得
+    api_key_to_use = await api_key_manager.get_next_key()
+    if not api_key_to_use:
+        print("エラー: 利用可能なAPIキーがありません。処理を中断します。")
         return None
+    
+    # 新しいSDKの作法に従い、中央集権的なClientオブジェクトを作成
+    client = genai.Client(api_key=api_key_to_use)
+    
+    # これから使うキーの情報を表示（インデックスは1から始まるように+1する）
+    key_info = api_key_manager.last_used_key_info
+    print(f"  > API Key: ...{key_info['key_snippet']} (Index: {key_info['index']+1}/{key_info['total']}) を使用します。")
 
     print("\nエージェント (戦略プランニング中...):")
-    # --- 修正点4: 'await' を付けて内部の非同期関数を呼び出す ---
-    strategy = await _decide_strategy(query)
+    # 初期化したクライアントを戦略プランナーに渡す
+    strategy = await _decide_strategy(query, client=client)
     
     thinking_language = strategy['language']
     difficulty = strategy['difficulty']
     
+    # 新しいSDKの厳密な作法に従い、設定オブジェクトを構築
     system_instruction = None
-    thinking_config = {'include_thoughts': True}
-
     if thinking_language == 'english':
         system_instruction = (
             "You are a practical and resourceful research agent. Your primary goal is to provide the most helpful and complete answer possible to the user, even if the information on the web is imperfect.\n"
@@ -102,16 +103,18 @@ async def ask_agent(query: str) -> dict | None:
         )
     
     model_name = 'gemini-2.5-flash'
+    thinking_config_obj = types.ThinkingConfig(include_thoughts=True)
+
     if difficulty == 'simple':
-        thinking_config['thinking_budget'] = 0
+        thinking_config_obj.thinking_budget = 0
         print(f"\nエージェント (戦略決定: [{thinking_language.upper()}] 思考不要タスク：低予算で実行)")
         print(f"model_name: {model_name} query: {query}")
     elif difficulty == 'hard':
-        thinking_config['thinking_budget'] = 8192
+        thinking_config_obj.thinking_budget = 8192
         print(f"\nエージェント (戦略決定: [{thinking_language.upper()}] 思考タスク：高予算で実行)")
         print(f"model_name: {model_name} query: {query}")
     else: # medium
-        thinking_config['thinking_budget'] = -1
+        thinking_config_obj.thinking_budget = -1
         print(f"\nエージェント (戦略決定: [{thinking_language.upper()}] 思考タスク：動的予算で実行)")
         print(f"model_name: {model_name} query: {query}")
     
@@ -122,39 +125,50 @@ async def ask_agent(query: str) -> dict | None:
         types.Tool(url_context=types.UrlContext())
     ]
     
-    config_dict = {'tools': tools_to_use, 'thinking_config': types.ThinkingConfig(**thinking_config)}
-    if system_instruction:
-        config_dict['system_instruction'] = system_instruction
-    
-    config = types.GenerateContentConfig(**config_dict)
+    # 全ての設定を、厳密な型のGenerateContentConfigオブジェクトにまとめる
+    config = types.GenerateContentConfig(
+        tools=tools_to_use,
+        thinking_config=thinking_config_obj,
+        system_instruction=system_instruction
+    )
 
     try:
-        # --- 修正点5: 'await' を付け、非同期クライアント 'client.aio' を使う ---
+        # 新しいSDKの作法に則り、client.models.generate_contentを呼び出す
         response = await client.aio.models.generate_content(
-            model=model_name, contents=query, config=config
+            model=model_name, 
+            contents=[query], 
+            config=config
         )
         
         answer, thought_summary = "", ""
-        for part in response.candidates[0].content.parts:
-            if not part.text: continue
-            if hasattr(part, 'thought') and part.thought: thought_summary += part.text
-            else: answer += part.text
+        # 新しいSDKのレスポンス構造に合わせて、より安全に解析
+        if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
+            for part in response.candidates[0].content.parts:
+                if hasattr(part, 'text') and part.text:
+                    if hasattr(part, 'thought') and part.thought:
+                        thought_summary += part.text
+                    else:
+                        answer += part.text
         
         sources = []
-        if hasattr(response.candidates[0], 'grounding_metadata') and response.candidates[0].grounding_metadata.grounding_supports:
-            for support in response.candidates[0].grounding_metadata.grounding_supports:
-                for index in support.grounding_chunk_indices:
-                    try:
-                        chunk = response.candidates[0].grounding_metadata.grounding_chunks[index]
-                        sources.append({'title': chunk.web.title, 'url': chunk.web.uri})
-                    except (IndexError, AttributeError): continue
+        if hasattr(response.candidates[0], 'grounding_metadata') and response.candidates[0].grounding_metadata:
+            grounding_meta = response.candidates[0].grounding_metadata
+            if grounding_meta.grounding_supports and grounding_meta.grounding_chunks:
+                for support in grounding_meta.grounding_supports:
+                    for index in support.grounding_chunk_indices:
+                        try:
+                            chunk = grounding_meta.grounding_chunks[index]
+                            if chunk.web:
+                                sources.append({'title': chunk.web.title, 'url': chunk.web.uri})
+                        except (IndexError, AttributeError):
+                            continue
         
         return {
-            'answer': answer, 
-            'sources': sources, 
+            'answer': answer,
+            'sources': sources,
             'thought_summary': thought_summary,
             'usage_metadata': response.usage_metadata
-            }
+        }
 
     except Exception as e:
         print(f"APIとの通信中にエラーが発生しました: {e}")

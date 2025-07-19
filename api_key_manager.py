@@ -1,5 +1,3 @@
-# api_key_manager.py (APIキーの管理に関する全てを司る、独立したモジュール)
-
 import os
 import json
 import asyncio
@@ -98,6 +96,26 @@ class ApiKeyManager:
             self._last_access_time = asyncio.get_event_loop().time() # キーを払い出した時刻を更新
             
             return self._api_keys[self._current_index]
+
+    @property
+    def last_used_key_info(self) -> dict:
+        """
+        最後に払い出されたキーに関する情報を返す読み取り専用プロパティ。
+        デバッグやロギング目的で使用する。
+        """
+        if self._current_index == -1 or not self._api_keys:
+            return {
+                "key_snippet": "N/A",
+                "index": -1,
+                "total": len(self._api_keys)
+            }
+        
+        key = self._api_keys[self._current_index]
+        return {
+            "key_snippet": key[-5:], # 最後の5文字
+            "index": self._current_index,
+            "total": len(self._api_keys)
+        }
 
 # シングルトンインスタンスとしてエクスポート（プログラム全体で一つのインスタンスを共有する）
 api_key_manager = ApiKeyManager()

@@ -57,10 +57,13 @@ def generate_markdown_report(log_summary: dict, base_filename: str):
                     if data.get('answer'):
                         f.write(f"### Answer\n\n")
                         # CSVデータの場合、コードブロックとして整形する
-                        if "```csv" in data['answer'] or "会社名,電話番号,住所" in data['answer']:
-                            f.write(f"```csv\n{data['answer'].strip()}\n```\n\n")
+                        answer_text = data['answer'].strip()
+                        if "```csv" in answer_text or "会社名,電話番号,住所" in answer_text or "名前,電話番号,住所" in answer_text:
+                            # 既存のコードブロックマーカーを削除してから囲む
+                            cleaned_answer = answer_text.replace("```csv", "").replace("```", "").strip()
+                            f.write(f"```csv\n{cleaned_answer}\n```\n\n")
                         else:
-                            formatted_answer = data['answer'].replace('\n', '  \n')
+                            formatted_answer = answer_text.replace('\n', '  \n')
                             f.write(f"{formatted_answer}\n\n")
 
                     if data.get('sources'):
@@ -241,4 +244,10 @@ async def main():
     print("--------------------------------------------------")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    finally:
+        # スクリプトの最後にセッションを保存する
+        from api_key_manager import api_key_manager
+        api_key_manager.save_session()
+        print("\nAPIキーのセッションを保存しました。")
