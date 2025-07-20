@@ -1,0 +1,1113 @@
+詳細に理解して
+
+
+---
+
+
+- フォルダ名: .
+- ファイル名: .session_data.json
+- 内容:
+{"lastKeyIndex": 7}
+
+
+---
+
+
+- フォルダ名: .
+- ファイル名: api_key_manager.py
+- 内容:
+import os
+import json
+import asyncio
+from dotenv import load_dotenv
+
+# .envファイルから環境変数を読み込む
+load_dotenv()
+
+# セッションファイル（最後に使ったキーのインデックスを保存する場所）
+SESSION_FILE = os.path.join(os.getcwd(), '.session_data.json')
+
+class ApiKeyManager:
+    """
+    複数のAPIキーを管理し、安全なローテーション、セッションの永続化、
+    および高負荷な並列処理下でのレースコンディションを回避するシステム。
+    """
+    def __init__(self):
+        self._api_keys: list[str] = []
+        self._current_index: int = -1
+        self._last_access_time: float = 0.0
+        # APIコール間のクールダウン時間（秒）。レート制限に対する安全マージン。
+        self._COOLDOWN_SECONDS = 0.1 # 0.1秒
+
+        # キー選択処理をアトミック（不可分）にするためのロック
+        self._key_selection_lock = asyncio.Lock()
+        
+        self._load_api_keys_from_env()
+        self._load_session()
+        
+        # シングルトンとして振る舞うためのクラス変数
+        ApiKeyManager._instance = self
+
+    def _load_api_keys_from_env(self):
+        """ .envファイルから全てのAPIキーを読み込む """
+        keys = set() # 重複を自動的に排除するためにセットを使用
+        # GOOGLE_API_KEY も読み込む
+        if os.getenv('GOOGLE_API_KEY'):
+            keys.add(os.getenv('GOOGLE_API_KEY'))
+        
+        # GOOGLE_API_KEY_1, _2, ... を読み込む
+        i = 1
+        while True:
+            key = os.getenv(f'GOOGLE_API_KEY_{i}')
+            if key:
+                keys.add(key)
+                i += 1
+            else:
+                break
+        
+        self._api_keys = list(keys)
+        if not self._api_keys:
+            print("警告: APIキーが.envファイルに設定されていません。")
+        else:
+            print(f"[{self.__class__.__name__}] {len(self._api_keys)}個のユニークなAPIキーをロードしました。")
+
+    def _load_session(self):
+        """ セッションファイルから、最後に使ったキーのインデックスを読み込む """
+        try:
+            if os.path.exists(SESSION_FILE):
+                with open(SESSION_FILE, 'r') as f:
+                    data = json.load(f)
+                    last_index = data.get('lastKeyIndex', -1)
+                    if 0 <= last_index < len(self._api_keys):
+                        self._current_index = last_index
+        except (IOError, json.JSONDecodeError) as e:
+            print(f"セッションファイルの読み込みに失敗しました: {e}")
+            self._current_index = -1
+
+    def save_session(self):
+        """ 最後に使ったキーのインデックスをセッションファイルに保存する """
+        try:
+            with open(SESSION_FILE, 'w') as f:
+                json.dump({'lastKeyIndex': self._current_index}, f)
+        except IOError as e:
+            print(f"セッションファイルの保存に失敗しました: {e}")
+
+    async def get_next_key(self) -> str | None:
+        """
+        次の利用可能なAPIキーを、安全な排他制御とクールダウン付きで取得する。
+        """
+        if not self._api_keys:
+            return None
+
+        # asyncio.Lockを使い、キーの選択とインデックス更新処理が同時に実行されないようにする
+        async with self._key_selection_lock:
+            now = asyncio.get_event_loop().time()
+            elapsed_time = now - self._last_access_time
+
+            # 前回の呼び出しからクールダウン時間内に再度呼び出された場合、待機する
+            if self._last_access_time > 0 and elapsed_time < self._COOLDOWN_SECONDS:
+                wait_time = self._COOLDOWN_SECONDS - elapsed_time
+                await asyncio.sleep(wait_time)
+            
+            # ラウンドロビン方式で次のインデックスを計算
+            self._current_index = (self._current_index + 1) % len(self._api_keys)
+            self._last_access_time = asyncio.get_event_loop().time() # キーを払い出した時刻を更新
+            
+            return self._api_keys[self._current_index]
+
+    @property
+    def last_used_key_info(self) -> dict:
+        """
+        最後に払い出されたキーに関する情報を返す読み取り専用プロパティ。
+        デバッグやロギング目的で使用する。
+        """
+        if self._current_index == -1 or not self._api_keys:
+            return {
+                "key_snippet": "N/A",
+                "index": -1,
+                "total": len(self._api_keys)
+            }
+        
+        key = self._api_keys[self._current_index]
+        return {
+            "key_snippet": key[-5:], # 最後の5文字
+            "index": self._current_index,
+            "total": len(self._api_keys)
+        }
+
+# シングルトンインスタンスとしてエクスポート（プログラム全体で一つのインスタンスを共有する）
+api_key_manager = ApiKeyManager()
+
+
+---
+
+
+- フォルダ名: .
+- ファイル名: gemini_agent.py
+- 内容:
+import os
+import json
+from google import genai
+from google.genai import types
+from dotenv import load_dotenv
+
+# api_key_managerのシングルトンインスタンスをインポート
+from api_key_manager import api_key_manager
+
+# .envファイルから環境変数を読み込む
+load_dotenv()
+
+async def _decide_strategy(query: str, client: genai.Client) -> dict:
+    """
+    【内部専用】第一エージェント：思考戦略プランナー。
+    与えられたクライアントインスタンスを使用して戦略を決定する。
+    """
+    prompt = f"""
+    You are a highly intelligent and meticulous strategic query analyzer. Your role is to determine the optimal strategy for a subordinate AI agent. You must follow the rules and examples provided below with extreme precision. Your final output must be a single, valid JSON object and nothing else.
+
+    **## Instructions ##**
+    1.  **Analyze the User Query:** Carefully read and understand the user's query.
+    2.  **Chain of Thought (CoT):** Internally, reason step-by-step to determine the optimal strategy. First, determine the 'language'. Second, determine the 'difficulty'. Your reasoning process itself should not be in the final output.
+    3.  **Determine 'language':**
+        *   **Rule:** The thinking language must be 'english' for all topics that are universal, abstract, technical, or international (e.g., finance, science, programming, business, art).
+        *   **Exception:** Only choose 'japanese' if the query is **unambiguously and exclusively Japan-specific**, meaning that searching in Japanese would yield significantly better results. This includes specific Japanese locations (e.g., "渋谷の天気"), domestic laws, or purely local cultural events. "Japanese anime" is considered an international topic.
+    4.  **Determine 'difficulty':**
+        *   **'simple':** For fact-checking or simple retrieval questions. `thinking_budget` will be `0`.
+        *   **'medium':** For queries that require explanation, comparison, or summarization. `thinking_budget` will be `-1` (dynamic).
+        *   **'hard':** For queries that demand deep reasoning, multi-step logic, creative synthesis, or complex analysis. `thinking_budget` will be high.
+    5.  **Output JSON:** Based on your reasoning, construct the final JSON object.
+
+    **## Examples (Few-Shot Learning) ##**
+    **Example 1:**
+    *   **User Query:** "日本の現在の首相は誰ですか？"
+    *   **Your JSON Output:** {{"language": "japanese", "difficulty": "simple"}}
+    **Example 2:**
+    *   **User Query:** "Pythonの非同期処理について"
+    *   **Your JSON Output:** {{"language": "english", "difficulty": "medium"}}
+    **Example 3:**
+    *   **User Query:** "米国ETFについて、利回りが良い順番に30個教えて"
+    *   **Your JSON Output:** {{"language": "english", "difficulty": "hard"}}
+
+    **## Your Task ##**
+    **User Query:** "{query}"
+    **Your JSON Output:**
+    """
+    
+    try:
+        response = await client.aio.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=[prompt]
+        )
+        # --- 修正箇所はここまで ---
+
+
+        # ```json ``` を消すロジックは、安全策として維持
+        json_text = response.text.strip().replace('```json', '').replace('```', '').strip()
+        strategy = json.loads(json_text)
+        if 'language' not in strategy or 'difficulty' not in strategy:
+            raise ValueError("Invalid JSON structure")
+        return strategy
+    except Exception as e:
+        print(f"戦略プランニングでエラーが発生したため、デフォルト戦略を適用します: {e}")
+        return {'language': 'japanese', 'difficulty': 'medium'}
+
+async def ask_agent(query: str) -> dict | None:
+    """
+    【唯一の公開窓口】ユーザーの質問を受け取り、戦略決定から回答生成までを一貫して行う。
+    """
+    # このクエリで使用するAPIキーを取得
+    api_key_to_use = await api_key_manager.get_next_key()
+    if not api_key_to_use:
+        print("エラー: 利用可能なAPIキーがありません。処理を中断します。")
+        return None
+    
+    # 新しいSDKの作法に従い、中央集権的なClientオブジェクトを作成
+    client = genai.Client(api_key=api_key_to_use)
+    
+    # これから使うキーの情報を表示（インデックスは1から始まるように+1する）
+    key_info = api_key_manager.last_used_key_info
+    print(f"  > API Key: ...{key_info['key_snippet']} (Index: {key_info['index']+1}/{key_info['total']}) を使用します。")
+
+    print("\nエージェント (戦略プランニング中...):")
+    # 初期化したクライアントを戦略プランナーに渡す
+    strategy = await _decide_strategy(query, client=client)
+    
+    thinking_language = strategy['language']
+    difficulty = strategy['difficulty']
+    
+    # 新しいSDKの厳密な作法に従い、設定オブジェクトを構築
+    system_instruction = None
+    if thinking_language == 'english':
+        system_instruction = (
+            "You are a practical and resourceful research agent. Your primary goal is to provide the most helpful and complete answer possible to the user, even if the information on the web is imperfect.\n"
+            "1.  **Understand the Goal:** First, think step-by-step in English to fully understand the user's core request (e.g., they want a list of 30 companies with specific data points).\n"
+            "2.  **Best-Effort Search:** Use your tools to search for the information. Be tenacious. If you can't find information on one site, try another. If one search query fails, try a different one.\n"
+            "3.  **Compile and Report:** After your search, compile the most complete list you were able to create. \n"
+            "    - **It is OKAY if the list is not perfect.** \n"
+            "    - If you find a company but are missing a specific data point (like a phone number), list the company and explicitly state 'Phone number not found' for that entry.\n"
+            "    - If you cannot find the total number of items requested (e.g., you only found 15 out of 30), that is also okay. Simply provide the 15 you found.\n"
+            "4.  **Final Answer:** Your final priority is to be helpful. Present the best data you found, be honest about what you could not find, and then generate the final answer in Japanese."
+        )
+    
+    model_name = 'gemini-2.5-flash'
+    thinking_config_obj = types.ThinkingConfig(include_thoughts=True)
+
+    if difficulty == 'simple':
+        thinking_config_obj.thinking_budget = 0
+        print(f"\nエージェント (戦略決定: [{thinking_language.upper()}] 思考不要タスク：低予算で実行)")
+        print(f"model_name: {model_name} query: {query}")
+    elif difficulty == 'hard':
+        thinking_config_obj.thinking_budget = 8192
+        print(f"\nエージェント (戦略決定: [{thinking_language.upper()}] 思考タスク：高予算で実行)")
+        print(f"model_name: {model_name} query: {query}")
+    else: # medium
+        thinking_config_obj.thinking_budget = -1
+        print(f"\nエージェント (戦略決定: [{thinking_language.upper()}] 思考タスク：動的予算で実行)")
+        print(f"model_name: {model_name} query: {query}")
+    
+    print("思考を開始します...")
+    
+    tools_to_use = [
+        types.Tool(google_search=types.GoogleSearch()),
+        types.Tool(url_context=types.UrlContext())
+    ]
+    
+    # 全ての設定を、厳密な型のGenerateContentConfigオブジェクトにまとめる
+    config = types.GenerateContentConfig(
+        tools=tools_to_use,
+        thinking_config=thinking_config_obj,
+        system_instruction=system_instruction
+    )
+
+    try:
+        # 新しいSDKの作法に則り、client.models.generate_contentを呼び出す
+        response = await client.aio.models.generate_content(
+            model=model_name, 
+            contents=[query], 
+            config=config
+        )
+        
+        answer, thought_summary = "", ""
+        # 新しいSDKのレスポンス構造に合わせて、より安全に解析
+        if response.candidates and response.candidates[0].content and response.candidates[0].content.parts:
+            for part in response.candidates[0].content.parts:
+                if hasattr(part, 'text') and part.text:
+                    if hasattr(part, 'thought') and part.thought:
+                        thought_summary += part.text
+                    else:
+                        answer += part.text
+        
+        sources = []
+        if hasattr(response.candidates[0], 'grounding_metadata') and response.candidates[0].grounding_metadata:
+            grounding_meta = response.candidates[0].grounding_metadata
+            if grounding_meta.grounding_supports and grounding_meta.grounding_chunks:
+                for support in grounding_meta.grounding_supports:
+                    for index in support.grounding_chunk_indices:
+                        try:
+                            chunk = grounding_meta.grounding_chunks[index]
+                            if chunk.web:
+                                sources.append({'title': chunk.web.title, 'url': chunk.web.uri})
+                        except (IndexError, AttributeError):
+                            continue
+        
+        return {
+            'answer': answer,
+            'sources': sources,
+            'thought_summary': thought_summary,
+            'usage_metadata': response.usage_metadata
+        }
+
+    except Exception as e:
+        print(f"APIとの通信中にエラーが発生しました: {e}")
+        return None
+
+
+---
+
+
+- フォルダ名: .
+- ファイル名: main_app.py
+- 内容:
+from gemini_agent import ask_agent
+import argparse
+import time
+import asyncio
+import os
+import json
+import logging
+from datetime import datetime
+import aiohttp
+
+def setup_logger(timestamp: str) -> tuple[logging.Logger, str]:
+    """ログファイルを設定し、ロガーとベースファイル名を返す"""
+    log_dir = "log"
+    os.makedirs(log_dir, exist_ok=True)
+    base_filename = os.path.join(log_dir, timestamp)
+    json_log_filename = f"{base_filename}.json"
+
+    logger = logging.getLogger('GeminiAgentLogger')
+    logger.setLevel(logging.INFO)
+    if logger.hasHandlers():
+        logger.handlers.clear()
+
+    file_handler = logging.FileHandler(json_log_filename, encoding='utf-8')
+    file_formatter = logging.Formatter('%(message)s')
+    file_handler.setFormatter(file_formatter)
+    logger.addHandler(file_handler)
+
+    return logger, base_filename
+
+def generate_markdown_report(log_summary: dict, base_filename: str):
+    """
+    実行結果のサマリーから、人間可読なMarkdownレポートを生成する。
+    トークン使用量の詳細も含まれる。
+    """
+    md_filename = f"{base_filename}.md"
+    
+    try:
+        with open(md_filename, 'w', encoding='utf-8') as f:
+            summary = log_summary["execution_summary"]
+            f.write(f"# Gemini Agent Batch Report\n\n")
+            f.write(f"**Execution Date:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"**Total Queries:** {summary['total_queries']}\n")
+            f.write(f"**Total Duration:** {summary['total_duration_seconds']:.2f} seconds\n\n")
+            f.write("---\n\n")
+
+            for result in log_summary["results"]:
+                f.write(f"## Query {result['query_number']}: `{result['query']}`\n\n")
+                f.write(f"**Status:** `{result['status']}`\n\n")
+
+                if result['status'] == 'SUCCESS':
+                    data = result['data']
+                    if data.get('thought_summary'):
+                        f.write(f"### Thought Summary\n\n")
+                        thought_text = data['thought_summary'].strip()
+                        f.write(f"> {thought_text.replace('\n', '\n> ')}\n\n")
+                    
+                    if data.get('answer'):
+                        f.write(f"### Answer\n\n")
+                        # CSVデータの場合、コードブロックとして整形する
+                        answer_text = data['answer'].strip()
+                        if "```csv" in answer_text or "会社名,電話番号,住所" in answer_text or "名前,電話番号,住所" in answer_text:
+                            # 既存のコードブロックマーカーを削除してから囲む
+                            cleaned_answer = answer_text.replace("```csv", "").replace("```", "").strip()
+                            f.write(f"```csv\n{cleaned_answer}\n```\n\n")
+                        else:
+                            formatted_answer = answer_text.replace('\n', '  \n')
+                            f.write(f"{formatted_answer}\n\n")
+
+                    if data.get('sources'):
+                        f.write(f"### Sources\n\n")
+                        unique_sources_in_md = []
+                        seen_urls_in_md = set()
+                        for source in data.get('sources', []):
+                             if source.get('url') not in seen_urls_in_md:
+                                unique_sources_in_md.append(source)
+                                seen_urls_in_md.add(source.get('url'))
+                        
+                        for source in unique_sources_in_md:
+                            title = source.get('title', 'N/A')
+                            url = source.get('url', '#')
+                            f.write(f"- **{title}**: <{url}>\n")
+                        f.write("\n")
+                    
+                    # トークン使用量のセクションを追加
+                    if data.get('usage_metadata'):
+                        usage = data['usage_metadata']
+                        f.write(f"### Token Usage\n\n")
+                        f.write(f"- **Input (Prompt):** {usage.get('prompt_token_count', 'N/A')} tokens\n")
+                        f.write(f"- **Output (Thought + Answer):** {usage.get('candidates_token_count', 'N/A')} tokens\n")
+                        f.write(f"- **Tool Response (Hidden):** {usage.get('tool_token_count', 'N/A')} tokens\n")
+                        f.write(f"- **Total:** {usage.get('total_token_count', 'N/A')} tokens\n\n")
+
+                elif 'error_message' in result:
+                    f.write(f"**Error Details:**\n")
+                    f.write(f"```\n{result['error_message']}\n```\n\n")
+                
+                f.write("---\n\n")
+        print(f"Markdownレポートが保存されました: {md_filename}")
+    except IOError as e:
+        print(f"Markdownレポートの書き込みに失敗しました: {e}")
+
+async def resolve_redirect_url(session: aiohttp.ClientSession, source: dict) -> dict:
+    original_url = source.get('url')
+    if not original_url: return source
+    try:
+        async with session.head(original_url, allow_redirects=True, timeout=5) as response:
+            resolved_source = source.copy()
+            resolved_source['url'] = str(response.url)
+            return resolved_source
+    except Exception:
+        return source
+
+async def main():
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    logger, base_filename = setup_logger(timestamp)
+    
+    header = "--------------------------------------------------\n" \
+             "Gemini検索エージェント (デュアル出力・最終完成版)\n" \
+             "--------------------------------------------------"
+    print(header)
+    
+    parser = argparse.ArgumentParser(description="ファイルから複数の質問を読み込み、Gemini検索エージェントに並列で実行させます。")
+    parser.add_argument("query_file", type=str, help="処理したい質問が1行ずつ書かれたテキストファイルのパス。")
+    parser.add_argument("-w", "--max-workers", type=int, default=10, help="同時に実行する並列タスクの最大数。")
+    args = parser.parse_args()
+
+    try:
+        with open(args.query_file, 'r', encoding='utf-8') as f:
+            queries = [line.strip() for line in f if line.strip()]
+        if not queries:
+            print("エラー: クエリファイルが空か、読み取り可能なクエリがありません。")
+            return
+    except FileNotFoundError:
+        print(f"エラー: ファイルが見つかりません - {args.query_file}")
+        return
+    
+    print(f"{len(queries)}件のクエリを、最大{args.max_workers}の並列度で実行します...")
+    
+    start_time = time.time()
+    
+    semaphore = asyncio.Semaphore(args.max_workers)
+    async def run_with_semaphore(query):
+        async with semaphore:
+            return await ask_agent(query)
+
+    tasks = [run_with_semaphore(query) for query in queries]
+    results_list = await asyncio.gather(*tasks, return_exceptions=True)
+
+    agent_processing_end_time = time.time()
+    
+    # URL解決とロギング処理
+    print("\n情報源のURLを非同期・並列で解決中...")
+    
+    log_summary_results = []
+    successful_tasks = 0
+    
+    async with aiohttp.ClientSession() as session:
+        for i, results in enumerate(results_list):
+            query_result = {"query_number": i + 1, "query": queries[i]}
+            if isinstance(results, Exception):
+                query_result["status"] = "ERROR"
+                query_result["error_message"] = str(results)
+            elif results:
+                successful_tasks += 1
+                query_result["status"] = "SUCCESS"
+
+                # usage_metadataオブジェクトを、JSONに変換可能な「普通の辞書」に変換し、「隠れトークン」を計算する
+                if 'usage_metadata' in results and results.get('usage_metadata'):
+                    usage = results['usage_metadata']
+                    
+                    prompt_tokens = usage.prompt_token_count
+                    candidate_tokens = usage.candidates_token_count
+                    total_tokens = usage.total_token_count
+                    
+                    tool_tokens = max(0, total_tokens - prompt_tokens - candidate_tokens)
+                    
+                    results['usage_metadata'] = {
+                        'prompt_token_count': prompt_tokens,
+                        'candidates_token_count': candidate_tokens,
+                        'tool_token_count': tool_tokens,
+                        'total_token_count': total_tokens
+                    }
+                
+                if results.get('sources'):
+                    resolution_tasks = [resolve_redirect_url(session, source) for source in results['sources']]
+                    resolved_sources = await asyncio.gather(*resolution_tasks, return_exceptions=True)
+                    results['sources'] = [s for s in resolved_sources if not isinstance(s, Exception)]
+
+                query_result["data"] = results
+            else:
+                query_result["status"] = "FAILURE"
+                query_result["error_message"] = "Agent returned an empty result."
+            log_summary_results.append(query_result)
+            
+    total_end_time = time.time()
+    total_duration = total_end_time - start_time
+
+    log_summary = {
+        "execution_summary": {
+            "total_queries": len(queries),
+            "max_workers": args.max_workers,
+            "total_duration_seconds": round(total_duration, 2),
+        },
+        "results": log_summary_results
+    }
+    
+    # ログファイルにJSON形式で書き出す
+    logger.info(json.dumps(log_summary, indent=2, ensure_ascii=False))
+    
+    # Markdownレポートを生成する
+    generate_markdown_report(log_summary, base_filename)
+    
+    # コンソールへのサマリー表示
+    print("\n==================================================")
+    print("           バッチ処理 結果サマリー")
+    print("==================================================")
+    for result_log in log_summary["results"]:
+        print(f"\n--- クエリ {result_log['query_number']:02d}: '{result_log['query']}' ---")
+        print(f"  [ステータス]: {result_log['status']}")
+        if result_log['status'] == 'SUCCESS':
+            answer_snippet = result_log['data']['answer'].replace('\n', ' ').strip()
+            print(f"  [回答の要約]: {answer_snippet[:100]}...")
+            
+            # トークン使用量の表示部分
+            if result_log['data'].get('usage_metadata'):
+                usage = result_log['data']['usage_metadata']
+                print("  [トークン使用量]:")
+                print(f"    - 入力 (プロンプト): {usage.get('prompt_token_count', 'N/A')} トークン")
+                print(f"    - 出力 (思考+回答): {usage.get('candidates_token_count', 'N/A')} トークン")
+                print(f"    - ツール応答 (隠れ): {usage.get('tool_token_count', 'N/A')} トークン")
+                print(f"    - 合計: {usage.get('total_token_count', 'N/A')} トークン")
+
+        elif 'error_message' in result_log:
+            print(f"  [エラー内容]: {result_log['error_message']}")
+
+    print("\n==================================================")
+    print("                  処理完了")
+    print("==================================================")
+    print(f"成功したタスク: {successful_tasks} / {len(queries)} 件")
+    print(f"合計処理時間: {total_duration:.2f}秒")
+    print(f"1クエリあたりの平均時間: {total_duration / len(queries):.2f}秒")
+    print(f"JSONログが保存されました: {base_filename}.json")
+    print(f"Markdownレポートが保存されました: {base_filename}.md")
+    print("--------------------------------------------------")
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    finally:
+        # スクリプトの最後にセッションを保存する
+        from api_key_manager import api_key_manager
+        api_key_manager.save_session()
+        print("\nAPIキーのセッションを保存しました。")
+
+
+---
+
+
+- フォルダ名: .
+- ファイル名: README.md
+- 内容:
+# Gemini検索エージェント (Self-Correcting Research Agent)
+
+## 概要
+
+これは、単なる検索ツールではありません。Googleの最新AIであるGeminiを搭載し、**自ら思考戦略を立て、自己評価と反復検索を繰り返す**ことで、ユーザーの要求に対して粘り強く、質の高い回答を生成することを目指す高度な検索エージェントです。
+
+このプロジェクトは、AIロジックを担う「専門エージェント」 (`gemini_agent.py`) と、ユーザーとの窓口となる「司令塔」 (`main_app.py`) に役割を完全に分離した、クリーンなアーキテクチャを採用しています。
+
+## 主な特徴
+
+-   **🧠 自律的な戦略プランニング**:
+    ユーザーの質問を分析し、「思考言語（英語/日本語）」と「難易度（高/中/低）」をAIが自ら判断。最適なアプローチで調査を開始します。
+
+-   **🔄 自己評価と反復検索**:
+    一度の検索で得られた情報が不十分な場合、エージェントは「何が足りないか」を自己評価し、より具体的なクエリで**追加のWeb検索を自動的に実行**します。これにより、情報の網羅性と精度を極限まで高めます。
+
+-   **🏢 関心の分離アーキテクチャ**:
+    AIの複雑なロジックはすべて`gemini_agent.py`にカプセル化。司令塔である`main_app.py`は、エージェントに仕事を依頼し、報告書を受け取るだけなので、コードの見通しが良く、メンテナンスや機能拡張が容易です。
+
+-   **🔍 透明性の確保**:
+    最終的な回答だけでなく、AIがどのように考え、調査を進めたかの「思考の要約」と、回答の根拠となった「情報源のURL」を明示。AIの判断プロセスを追跡できます。
+
+## 技術スタック
+
+-   Python 3.8以上
+-   **Google AI Python SDK (`google-genai`)**
+-   Requests (情報源URLの解決用)
+-   Python-Dotenv (APIキー管理用)
+
+---
+
+## 🚀 セットアップ手順
+
+### 1. リポジトリをクローン
+
+```bash
+git clone <リポジトリのURL>
+cd <リポジトリ名>
+```
+
+### 2. Python仮想環境の作成と有効化
+
+クリーンな環境で実行するために、仮想環境を作成することを強く推奨します。
+
+```bash
+# 仮想環境を作成
+python -m venv venv
+
+# 仮想環境を有効化
+# Windowsの場合
+.\venv\Scripts\activate
+# macOS / Linuxの場合
+source venv/bin/activate
+```
+
+### 3. APIキーの設定
+
+1.  [Google AI Studio](https://aistudio.google.com/app/apikey)にアクセスし、APIキーを取得します。
+2.  プロジェクトのルートディレクトリに `.env` という名前のファイルを作成します。
+3.  作成した`.env`ファイルに、取得したAPIキーを以下のように記述します。
+
+    **.env**
+    ```
+    GOOGLE_API_KEY="ここにあなたのAPIキーを貼り付けてください"
+    ```
+
+### 4. 依存パッケージのインストール
+
+`requirements.txt`ファイルに必要なライブラリがすべて記載されています。以下のコマンドで一度にインストールします。
+
+```bash
+pip install -r requirements.txt
+```*(もし`uv`をお使いの場合は `uv pip install -r requirements.txt` でも同様にインストールできます)*
+
+
+## 実行方法
+
+セットアップが完了したら、ターミナルから`main_app.py`を実行します。引数として、エージェントに尋ねたい質問を文字列で渡してください。
+
+### 実行例
+
+**単純な質問:**
+```bash
+python main_app.py "日本の現在の首相は誰ですか？"
+```
+
+**専門的な調査:**
+```bash
+python main_app.py "米国株で、配当利回りが4%以上の銘柄を5つ、その利回りデータと共に教えて"
+```
+
+**複雑な分析:**
+```bash
+python main_app.py "Pythonの非同期処理について、async/awaitの基本的な使い方とメリット・デメリットをまとめて"
+```
+
+---
+
+## 🏛️ アーキテクチャとコード解説
+
+### `main_app.py` (司令塔)
+-   **役割**: ユーザーからの指令（コマンドライン引数）を受け取り、エージェントに渡し、返ってきた報告書（結果）を見やすく表示することに特化しています。
+-   AIの内部ロジックについては一切関知しません。
+-   受け取った情報源のURL（リダイレクトされている場合がある）を解決し、最終的なURLを表示する機能も持ちます。
+
+### `gemini_agent.py` (専門エージェント)
+-   **役割**: このアプリケーションの頭脳です。指令を達成するための全てのAIロジックを内包します。
+-   **`_decide_strategy(query)`**:【内部関数】第一エージェント。指令の性質を分析し、最適な「思考言語」と「難易度」からなる戦略を立案します。
+-   **`ask_agent(query)`**:【公開関数】第二エージェントであり、唯一の公開窓口。立案された戦略に基づき、システムプロンプト（自己評価と反復検索のルール）を設定し、Google検索ツールを使って調査を実行。最終的な回答、思考の要約、情報源を生成して司令塔に報告します。
+
+## ライセンス
+
+このプロジェクトは [MITライセンス](LICENSE) の下で公開されています。
+
+承知いたしました。これまでの対話と、一連のバッチ処理から得られたすべての知見、ノウハウ、そして完成したスクリプトの使い方を、一つの完璧な`README.md`ファイルにまとめます。
+
+このファイルをプロジェクトのルートディレクトリに保存すれば、誰でもこの強力なAIエージェントを最大限に活用できるようになります。
+
+---
+
+# Gemini AI 並列実行エージェント
+
+## 概要
+
+このプロジェクトは、GoogleのGeminiモデルを搭載したAIエージェントを活用し、Web検索やURLコンテンツの読み取りを伴う反復的な情報収集タスクを、**並列処理によって高速に自動化する**ためのツールです。
+
+テキストファイルに複数の質問（クエリ）を記述するだけで、各クエリを独立したタスクとして同時に実行し、結果を構造化されたJSONログと、人間が読みやすいMarkdownレポートとして出力します。
+
+## 主な機能
+
+-   **バッチ処理:** テキストファイルから複数のクエリを読み込み、一括で実行します。
+-   **並列実行:** `asyncio`を活用し、複数のタスクを同時に処理することで、全体の実行時間を大幅に短縮します。
+-   **動的な戦略決定:** 各クエリの言語や難易度をAIが自動で分析し、思考予算（`thinking_budget`）などを最適化します。
+-   **デュアル出力:**
+    -   **JSONログ:** 全ての実行結果を、再利用や分析に適した構造化データとして保存します。
+    -   **Markdownレポート:** 人間が結果を確認しやすいように、整形されたレポートを自動生成します。
+-   **高度なプロンプト制御:** クエリに特定のフラグ（`#url_context`）を含めることで、AIの行動様式を動的に変更できます。
+
+## 構成ファイル
+
+-   `gemini_agent.py`: 中核となるAIエージェント。戦略決定とGemini APIとの通信を担います。
+-   `main_app.py`: バッチ処理と並列実行を管理する実行スクリプト。
+-   `requirements.txt`: 必要なPythonライブラリのリスト。
+-   `.env`: APIキーなどの環境変数を格納するファイル。
+
+## セットアップ
+
+1.  **リポジトリのクローンまたはダウンロード**
+    プロジェクトファイルをローカル環境に配置します。
+
+2.  **.envファイルの作成**
+    プロジェクトのルートに`.env`という名前のファイルを作成し、お使いのGoogle AI APIキーを以下のように記述します。
+    ```
+    GOOGLE_API_KEY="ここにあなたのAPIキーを貼り付け"
+    ```
+
+3.  **必要なライブラリのインストール**
+    ターミナルで以下のコマンドを実行し、必要なライブラリをインストールします。
+    ```bash
+    pip install -r requirements.txt
+    ```
+
+## 使い方
+
+1.  **クエリファイルの準備**
+    処理したい質問を1行ずつ記述したテキストファイルを作成します。（例: `queries.txt`）
+
+2.  **スクリプトの実行**
+    ターミナルで`main_app.py`を実行します。引数として、準備したクエリファイルのパスを指定します。
+
+    ```bash
+    python main_app.py queries.txt
+    ```
+    -   `-w`または`--max-workers`オプションで、並列実行するタスクの最大数を指定できます。（デフォルトは10）
+        ```bash
+        python main_app.py queries.txt -w 5
+        ```
+
+3.  **結果の確認**
+    実行が完了すると、`log`ディレクトリ内にタイムスタンプ付きのファイルが2つ生成されます。
+    -   `YYYYMMDD_HHMMSS.json`: 全ての詳細情報が含まれたJSONログ。
+    -   `YYYYMMDD_HHMMSS.md`: 整形されたMarkdownレポート。
+
+---
+
+## ⭐ AIエージェントを使いこなすための黄金律（最重要） ⭐
+
+一連の実験を通じて、このAIエージェントの性能を最大限に引き出すための、最も効果的な利用方法が確立されました。
+
+### 基本原則：人間が「戦略家」、AIが「実行部隊」
+
+AIは、曖昧で複雑な「発見」タスクよりも、明確で単純な「作業」タスクの方が圧倒的に得意です。
+したがって、最も良い結果を得るためには、人間が賢い監督として振る舞い、タスクをAIが実行しやすい形に設計する必要があります。
+
+> **複雑な問題を、人間がAIの解きやすい単純なタスクに分解して与えること。**
+> これが、このシステムを使いこなすための鍵です。
+
+### 黄金律：「30件バッチ」という最適戦略
+
+大量のデータ（例: 100件以上の企業リスト）を一度に処理させようとすると、AIは思考プロセスの途中で時間やトークンの上限に達し、最終的な答えを出力できずに失敗します。
+
+実験の結果、以下の**「スイートスポット（最適値）」**が判明しました。
+
+> **一度にAIに処理させる件数は「30件」程度に分割するのが、最も安定的かつ効率的に完璧な結果を得られる方法です。**
+
+タスクが単純な場合は40件程度まで成功しますが、安定性を最優先するなら30件が黄金律です。
+
+### 実践的なワークフロー：2ステップ戦略
+
+#### ステップ1：発見フェーズ（大まかなリストアップ）
+
+まず、AIに「検証」や「確認」を求めず、**とにかく名前をリストアップさせる**ことだけに集中させます。
+
+-   **クエリの例 (`step1.txt`): １行づつの質問を記述してください。**
+    ```
+    大阪市天王寺区のお寺の名前を、できるだけ多くリストアップしてください。
+    大阪市天王寺区のお寺の名前を、できるだけ多くリストアップしてください。
+    大阪市天王寺区のお寺の名前を、できるだけ多くリストアップしてください。
+    ```
+-   **実行:**
+    ```bash
+    python main_app.py step1.txt
+    ```    これにより、AIはウェブサイトの有無などを気にせず、高速で大量の候補リストを生成します。
+
+#### ステップ2：情報収集フェーズ（個別撃破）
+
+ステップ1で得られた.jsonファイルのリストに注目します。
+answerで検索してください。
+"answer": "大阪市天王寺区にあるお寺の名前を以下にリストアップします。\n\n*   妙光寺\n*   堂閣寺\n*   道善寺\n*   妙覚寺\n*   "
+上記のような感じで、たくさん出力されます。
+\nは改行コードこれを活かします。
+**エディタで、\nを検索して、1行に30件ある状態を作ります**
+そして、それぞれのファイルに対して、具体的な情報収集を依頼します。
+
+-   **クエリの例 (`step2_part1.txt`):**
+    ```
+    以下の大阪市天王寺区の以下のお寺について、名前,電話番号,住所のcsvにして、リストアップしてください。妙光寺\n*   堂閣寺\n*   道善寺\n*   妙覚寺\n*    ... (30件分)
+    ```
+-   **実行:**
+    ```bash
+    python main_app.py step2_part1.txt
+    ```
+    この方法であれば、AIは一つ一つのタスクが単純なため、迷うことなく最高のパフォーマンスを発揮し、完璧なCSVを生成します。
+
+---
+
+## 高度なプロンプト技術
+
+### `#url_context` フラグの活用
+
+ユーザーが特定のURLの内容を深く調査してほしい場合、クエリの末尾に`#url_context`と記述します。これにより、AIは`url_context`ツールの使用を最優先する専用モードで動作します。
+
+-   **使用例:**
+    `米国ETFの高利回り銘柄について、この記事（https://example.com/etf-ranking）を参考にしてリストアップして。 #url_context`
+
+### 制約の緩和
+
+AIに「絶対に50件」のような厳格な制約を与えると、達成不可能な場合に処理を諦めてしまうことがあります。
+
+-   **悪い例:** `企業名を50件リストアップして。`
+-   **良い例:** `企業名を可能な限り多くリストアップしてください。**見つけられただけで構いません。**`
+
+「〜だけで構いません」「可能な範囲で」といった言葉は、AIに不完全な結果でも報告する許可を与え、結果を出力させる上で非常に有効です。
+
+## AIの限界とトラブルシューティング
+
+-   **ログインの壁:** 会員登録やログインが必要なサイトの情報は取得できません。
+-   **複雑なナビゲーション:** サイト内のリンクを複数回クリックして情報を探すような、複雑な操作は苦手です。
+-   **`FAILURE: Agent returned an empty result.`:**
+    タスクが複雑すぎるか、制約が厳しすぎます。上記の「黄金律」に従い、タスクを分割・単純化してください。
+-   **`SUCCESS`なのに`Answer`が出力されない:**
+    タスク量が多すぎて、AIが途中で力尽きています。一度に処理させる件数を減らしてください。（30件が推奨）
+
+
+---
+
+### プロンプト設計の神髄：速度とコストのトレードオフ
+
+驚くべきことに、AIに求める出力形式をどう指示するかで、処理の**「速度」**と**「コスト（消費トークン）」**が大きく変わることが判明しました。これは、AIの内部的な思考プロセスと、仕事の「丁寧さ」が変化するためです。
+
+あなたの目的に応じて、プロンプトの表現を戦略的に使い分けることで、このエージェントの性能を最大限に引き出すことができます。
+
+| | 速度優先モード | コスト優先モード |
+| :--- | :--- | :--- |
+| **プロンプトの例** | `...名前,電話番号,住所を**CSVで**取得して` | `...名前,電話番号,住所を**取得して**` |
+| **実行速度** | **速い** | 遅い |
+| **消費トークン（コスト）** | 高い | **安い** |
+| **AIの内部的な挙動<br>（なぜそうなるか）** | 出力形式が「CSV」という強力な制約によってAIの「迷い」がなくなり、処理が一直線の「作業」になるため**高速化**します。
+
+一方で、機械的可読性の高いデータを保証しようと、より多くの情報源を照合（ツールを多用）するため、「隠れトークン」が増加し**コストは高くなる**傾向があります。 | 出力形式が自由なため、AIは「どう報告するのが親切か」というプレゼンテーションについて**思考する時間が必要**です。その分、実行時間は長くなります。
+
+一方で、人間向けの報告が目的なので、一つの信頼できる情報源が見つかれば満足し、過剰な裏取り（ツールの使用）を控えるため、総消費トークンは**安くなる**傾向があります。 |
+
+---
+
+### 結論：あなたの目的に合わせて使い分ける
+
+-   **最速の結果が欲しい場合:**
+    プロンプトで`CSVで取得して`のように、**出力形式を厳密に指定**してください。AIの思考をショートカットさせ、最速で処理を完了させます。
+
+-   **コストを最小限に抑えたい場合:**
+    プロンプトを`取得して`のように、**出力形式を曖昧に**してください。AIの過剰なツール使用を抑制し、最も安価にタスクを実行します。
+
+
+---
+
+
+- フォルダ名: .
+- ファイル名: requirements.txt
+- 内容:
+google-genai
+dotenv
+requests
+aiohttp
+
+
+---
+
+
+- フォルダ名: .
+- ファイル名: step01.txt
+- 内容:
+大阪府大阪市天王寺区でお寺の名称をできるだけたくさん教えて。 # 出力は、名称のみのcsv 
+大阪府大阪市天王寺区でお寺の名称をできるだけたくさん教えて。 # 出力は、名称のみのcsv
+大阪府大阪市天王寺区でお寺の名称をできるだけたくさん教えて。 # 出力は、名称のみのcsv
+
+
+
+---
+
+
+- フォルダ名: .
+- ファイル名: step02.txt
+- 内容:
+大阪市天王寺区下寺町にお寺が24ヶ所あるようです。# 名前のみ # 改行なしのCSVで出力 
+大阪市天王寺区生玉寺町にお寺が20ヶ所あるようです。# 名前のみ # 改行なしのCSVで出力
+大阪市天王寺区城南寺町にお寺が17ヶ所あるようです。# 名前のみ # 改行なしのCSVで出力
+大阪市天王寺区生玉町にお寺が13ヶ所あるようです。# 名前のみ # 改行なしのCSVで出力
+大阪市天王寺区上本町にお寺が10ヶ所あるようです。# 名前のみ # 改行なしのCSVで出力
+大阪市天王寺区餌差町にお寺が9ヶ所あるようです。# 名前のみ # 改行なしのCSVで出力
+大阪市天王寺区夕陽丘町にお寺が9ヶ所あるようです。# 名前のみ # 改行なしのCSVで出力
+
+
+---
+
+
+- フォルダ名: .
+- ファイル名: step03_extract_json.py
+- 内容:
+import json
+import os
+import sys
+import re
+def format_temple_list(input_filename, items_per_line=30):
+    """
+    寺院リストが書かれたテキストファイルを読み込み、
+    全寺院を一度連結した後、指定された数ごとに改行して整形する。
+
+    Args:
+        input_filename (str): 入力するテキストファイル名。
+        items_per_line (int): 1行あたりに並べる寺院の数。
+    """
+    # 元のファイル名に "_formatted" を付けて出力ファイル名を生成
+    base_name, ext = os.path.splitext(input_filename)
+    output_filename = f"{base_name}.txt_formatted.txt"
+
+    try:
+        # ファイルを読み込む
+        with open(input_filename, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+
+        all_temples = []
+        # 各行を処理して、全寺院名を一つのリストにまとめる
+        for line in lines:
+            line = line.strip()
+            if not line:  # 空行は無視
+                continue
+
+            # 行末に '.' があれば取り除く
+            if line.endswith('.'):
+                line = line[:-1]
+
+            # カンマ「,」と読点「、」の両方で分割する
+            # これにより、どちらの記号が使われていても対応可能
+            temples_in_line = re.split(r'[、,]', line)
+
+            # 分割した各要素の前後の空白を削除し、中身が空でなければリストに追加
+            all_temples.extend([temple.strip() for temple in temples_in_line if temple.strip()])
+
+        # 整形後の各行を格納するリスト
+        formatted_lines = []
+        
+        # 固定の接頭辞（先頭につける文章）を定義
+        prefix_string = '大阪市天王寺区に以下のお寺があります。それぞれの寺の名前,電話番号,住所\\nをCSVで抽出して　解説は不要　# google_search '
+        
+        # 全寺院リストを、指定された数（items_per_line）ずつのまとまりに分割
+        for i in range(0, len(all_temples), items_per_line):
+            chunk = all_temples[i:i + items_per_line]
+            
+            # チャンク（寺院のまとまり）をカンマで連結して寺院リスト部分の文字列を作成
+            temple_list_string = ",".join(chunk)
+            
+            # 接頭辞と寺院リストを「+」で連結して、1行分の完全な文字列を作成する
+            full_line = prefix_string + temple_list_string
+            
+            # 完成した1行をリストに追加する
+            formatted_lines.append(full_line)
+            
+        # 整形されたすべての行を、改行文字で連結して最終的な出力データを作成
+        output_data = "\n".join(formatted_lines)
+
+        # 新しいファイルに書き出す
+        with open(output_filename, 'w', encoding='utf-8') as f:
+            f.write(output_data)
+
+        print(f"'{output_filename}' に整形後のリストを正常に書き出しました。")
+        print(f"合計 {len(all_temples)} 件のデータを、1行あたり最大 {items_per_line} 件で整形しました。")
+
+    except FileNotFoundError:
+        print(f"エラー: ファイル '{input_filename}' が見つかりません。")
+    except Exception as e:
+        print(f"予期せぬエラーが発生しました: {e}")
+
+def extract_temple_lists(input_filename):
+    """
+    JSONファイルから寺院名のリストのみを抽出し、テキストファイルに書き出す。
+    - カンマ区切りのリスト形式を優先して抽出する。
+    - 上記が見つからない場合、箇条書きからリストを生成する。
+
+    Args:
+        input_filename (str): 入力するJSONファイル名。
+    """
+    # 出力ファイル名を生成 (例: AAA.json -> AAA.txt)
+    base_name = os.path.splitext(input_filename)[0]
+    output_filename = f"{base_name}.txt"
+
+    try:
+        with open(input_filename, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        extracted_lists = []
+
+        # 'results' のリストをループ処理
+        if 'results' in data and isinstance(data['results'], list):
+            for result in data['results']:
+                if 'data' in result and 'answer' in result['data']:
+                    answer_text = result['data']['answer']
+                    lines = answer_text.splitlines()
+                    
+                    found_list = False
+
+                    # --- 戦略1: まずカンマ区切りのリスト形式の行を探す ---
+                    for line in lines:
+                        line = line.strip()
+                        # 条件: カンマが2つ以上含まれる行をリスト候補とする
+                        if line.count(',') + line.count('、') >= 2:
+                            # ただし、明らかに文章であるものは除外する
+                            if not any(prose in line for prose in ['です', 'ます', 'Here', ' a list of', ' as follows:']):
+                                extracted_lists.append(line)
+                                found_list = True
+                                break # このanswerの処理は完了
+                    
+                    if found_list:
+                        continue # 次のresultへ
+
+                    # --- 戦略2: カンマ区切りのリストが見つからない場合、箇条書きを解析 ---
+                    temple_names = []
+                    # 「* 名前」「1. 名前」のような形式にマッチする正規表現
+                    # 名前の後のカッコ書き「（）」やブラケット「[]」は除外する
+                    list_item_pattern = re.compile(r"^\s*[*1-9]+\.?\s*([^(\[（]+)")
+                    
+                    for line in lines:
+                        match = list_item_pattern.match(line)
+                        if match:
+                            # マッチした部分（寺院名）の前後の空白を削除してリストに追加
+                            name = match.group(1).strip()
+                            temple_names.append(name)
+                    
+                    # 箇条書きから名前が一つでも取れたら、カンマで連結してリストに追加
+                    if temple_names:
+                        extracted_lists.append(",".join(temple_names))
+
+        # 抽出したすべてのリストをテキストファイルに書き出す
+        if extracted_lists:
+            # 各リストの間には空行を1行いれる
+            with open(output_filename, 'w', encoding='utf-8') as f:
+                f.write("\n".join(extracted_lists))
+            print(f"'{output_filename}' に寺院リストを正常に書き出しました。")
+        else:
+            print("抽出対象のリストが見つかりませんでした。")
+
+    except FileNotFoundError:
+        print(f"エラー: ファイル '{input_filename}' が見つかりません。")
+    except json.JSONDecodeError:
+        print(f"エラー: ファイル '{input_filename}' は有効なJSON形式ではありません。")
+    except Exception as e:
+        print(f"予期せぬエラーが発生しました: {e}")
+
+# スクリプトを実行
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("エラー: 入力ファイル名を指定してください。")
+        print(f"使用法: python {sys.argv[0]} <入力JSONファイル名>")
+        sys.exit(1)
+
+    input_file  = sys.argv[1]
+    extract_temple_lists(input_file)
+    input_file2 = input_file.split('.')[0] + '.txt'
+    format_temple_list(input_file2, items_per_line=30)
+    print('処理が完了しました。')
+
+
+
+---
+
+
+- フォルダ名: .
+- ファイル名: step04.txt
+- 内容:
+大阪市天王寺区に以下のお寺があります。それぞれの寺の名前,電話番号,住所\nをCSVで抽出して　解説は不要　# google_search 円成院,大覚寺,心光寺,金台寺,光伝寺,幸念寺,源聖寺,光明寺,西念寺,大蓮寺,無衰山浄國寺,西往寺,宗教法人善龍寺,應典院,宗教法人正覚寺,善福寺,銀山寺,宗教法人大善寺,大安寺,浄運寺,青蓮寺,堂閣寺,清恩寺,法善寺 別院,大寶寺,宗教法人光善寺,宗教法人光聖寺,圓通寺,増福寺,法泉寺
+大阪市天王寺区に以下のお寺があります。それぞれの寺の名前,電話番号,住所\nをCSVで抽出して　解説は不要　# google_search 蓮生寺,宝樹寺,全慶院,仏心寺,天龍院,法藏院,楞厳寺,大善寺,極楽寺,観音寺,誓安寺,顕祥寺,長安寺,大通寺,洞泉寺,梅松院,西方寺,安楽寺,本誓寺,一乗寺,隆専寺,法音寺,菩提寺,生国魂神社,宝国寺,光善寺,月江寺,大安寺,白毫院増福寺
+大阪市天王寺区に以下のお寺があります。それぞれの寺の名前,電話番号,住所\nをCSVで抽出して　解説は不要　# google_search MapFanの検索結果 を基に,大阪市天王寺区上本町にある寺院を抽出しました。,成道寺,慶傳寺,西念寺,六大院,伝長寺,大応寺,興徳寺,最勝寺,心眼寺,十三まいりの寺（太平寺）,愛染堂勝鬘院（愛染さん）,大江神社
